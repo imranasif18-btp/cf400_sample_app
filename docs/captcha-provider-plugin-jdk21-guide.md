@@ -169,100 +169,166 @@ Create/extend a custom extension, e.g. `cf400captcha` (or reuse an existing
 
 ### 4.1 The validation strategy — the plug-in point
 
-Implement the platform CAPTCHA validation strategy interface. The strategy
-receives the token and must return whether it is valid.
+**The interface (confirmed OOTB, `2211-jdk21`):**
+`de.hybris.platform.commercewebservicescommons.strategies.CaptchaValidationStrategy`
+has **four** abstract methods — all must be implemented, which is exactly why a
+partial implementation fails with *"is not abstract and does not override
+abstract method preCheckToken(CaptchaValidationContext)"*:
 
-> ⚠️ **Confirm the exact interface + method name against your version's
-> javadoc** (`GET /doc/.../commercewebservicescommons/...`), because names have
-> shifted across releases. In the `2211-jdk21` line the plug-in point is the
-> CAPTCHA validation strategy bean invoked by `CaptchaValidationInterceptor`.
-> The pattern below is stable even if the FQN differs slightly.
+| Method | Returns | Purpose |
+|---|---|---|
+| `preCheckToken(CaptchaValidationContext)` | `boolean` | cheap format/regex pre-check before the remote call |
+| `validate(CaptchaValidationContext)` | `CaptchaValidationResult` | **real validation** — call your provider here |
+| `getProviderType()` | `CaptchaProviderWsDtoType` | which provider (`DEFAULT`, …) |
+| `getVersion()` | `CaptchaVersionWsDtoType` | provider version (`V1`, …) |
+
+DTOs live in `de.hybris.platform.commercewebservicescommons.dto.captcha`.
+`CaptchaValidationContext.getCaptchaToken()` returns the token;
+`CaptchaValidationResult` has `setSuccess(boolean)` (+ a reason for failures).
+
+> **Why this matters:** the OOTB `DefaultCaptchaValidationStrategy.validate()`
+> **always returns `success = true`** (a no-op stub). So on `2211-jdk21.13` the
+> plug-in exists but *validates nothing* until you supply real logic. This is
+> the migration.
 
 ```java
-package com.cf400.captcha.strategy;
+package com.alfanar.hybris.ceramic.core.strategies.impl;
 
+import de.hybris.platform.commercewebservicescommons.dto.captcha.CaptchaProviderWsDtoType;
+import de.hybris.platform.commercewebservicescommons.dto.captcha.CaptchaValidationContext;
+import de.hybris.platform.commercewebservicescommons.dto.captcha.CaptchaValidationResult;
+import de.hybris.platform.commercewebservicescommons.dto.captcha.CaptchaVersionWsDtoType;
+import de.hybris.platform.commercewebservicescommons.strategies.CaptchaValidationStrategy;
 import de.hybris.platform.servicelayer.config.ConfigurationService;
-// import de.hybris.platform.commercewebservicescommons.strategies.CaptchaValidationStrategy; // verify FQN
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
+import java.util.regex.Pattern;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * Google reCAPTCHA v2/v3 implementation of the CAPTCHA plug-in point.
- * Registered as the strategy bean the interceptor delegates to.
+ * Google reCAPTCHA v2 (checkbox) implementation of the CAPTCHA plug-in point.
+ * Replaces the no-op DefaultCaptchaValidationStrategy with real verification.
  */
-public class GoogleReCaptchaValidationStrategy /* implements CaptchaValidationStrategy */ {
-
+public class GoogleReCaptchaValidationStrategy implements CaptchaValidationStrategy
+{
+    private static final Logger LOG = LoggerFactory.getLogger(GoogleReCaptchaValidationStrategy.class);
     private static final String VERIFY_URL = "https://www.google.com/recaptcha/api/siteverify";
+    private static final Pattern TOKEN_PATTERN = Pattern.compile("^[0-9a-zA-Z-_]+$");
+
     private ConfigurationService configurationService;
     private final HttpClient httpClient = HttpClient.newHttpClient(); // Java 21 java.net.http
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    // @Override
-    public boolean validate(final String captchaToken) {
-        if (StringUtils.isBlank(captchaToken)) {
-            return false;
-        }
-        final String secret = configurationService.getConfiguration()
+    /** Cheap format pre-check (mirrors the OOTB regex). Interceptor calls this first. */
+    @Override
+    public boolean preCheckToken(final CaptchaValidationContext context)
+    {
+        final String token = context.getCaptchaToken();
+        return Objects.nonNull(token) && TOKEN_PATTERN.matcher(token).matches();
+    }
+
+    /** Real validation: verify the token with Google's siteverify endpoint. */
+    @Override
+    public CaptchaValidationResult validate(final CaptchaValidationContext context)
+    {
+        final CaptchaValidationResult result = new CaptchaValidationResult();
+        final String token = context.getCaptchaToken();
+        final String secret = getConfigurationService().getConfiguration()
                 .getString("captcha.recaptcha.secretKey", StringUtils.EMPTY);
-        if (StringUtils.isBlank(secret)) {
-            return false; // fail closed if misconfigured
+
+        if (StringUtils.isBlank(token) || StringUtils.isBlank(secret))
+        {
+            result.setSuccess(false); // fail closed on missing token/misconfig
+            return result;
         }
-        try {
-            final String body = "secret=" + enc(secret) + "&response=" + enc(captchaToken);
+        try
+        {
+            final String body = "secret=" + enc(secret) + "&response=" + enc(token);
             final HttpRequest request = HttpRequest.newBuilder(URI.create(VERIFY_URL))
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .POST(HttpRequest.BodyPublishers.ofString(body))
                     .build();
             final HttpResponse<String> resp =
                     httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            final var node = objectMapper.readTree(resp.body());
-            final boolean success = node.path("success").asBoolean(false);
-            // For reCAPTCHA v3, also enforce a score threshold:
-            // return success && node.path("score").asDouble(0d) >= 0.5d;
-            return success;
-        } catch (final Exception e) {
-            // log + fail closed
-            return false;
+            final JsonNode json = objectMapper.readTree(resp.body());
+            boolean success = json.path("success").asBoolean(false);
+            // reCAPTCHA v3 only — also enforce a score threshold:
+            // success = success && json.path("score").asDouble(0d) >= 0.5d;
+            result.setSuccess(success);
         }
+        catch (final InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+            LOG.error("reCAPTCHA verification interrupted", e);
+            result.setSuccess(false);
+        }
+        catch (final Exception e)
+        {
+            LOG.error("reCAPTCHA verification failed", e);
+            result.setSuccess(false); // fail closed
+        }
+        return result;
     }
 
-    private static String enc(final String v) {
+    @Override
+    public CaptchaProviderWsDtoType getProviderType()
+    {
+        // Keep DEFAULT to override the OOTB strategy in place (single provider).
+        // If your CaptchaProviderWsDtoType enum has a reCAPTCHA-specific value
+        // and you run multiple providers, return that instead.
+        return CaptchaProviderWsDtoType.DEFAULT;
+    }
+
+    @Override
+    public CaptchaVersionWsDtoType getVersion()
+    {
+        return CaptchaVersionWsDtoType.V1; // set to the enum value matching your reCAPTCHA version
+    }
+
+    private static String enc(final String v)
+    {
         return URLEncoder.encode(v, StandardCharsets.UTF_8);
     }
 
-    public void setConfigurationService(final ConfigurationService cs) {
-        this.configurationService = cs;
-    }
+    public ConfigurationService getConfigurationService() { return configurationService; }
+    public void setConfigurationService(final ConfigurationService cs) { this.configurationService = cs; }
 }
 ```
 
 ### 4.2 Register the strategy at the plug-in point (Spring)
 
-In `resources/<ext>-spring.xml` (web/OCC application context that carries the
-interceptor), define your bean and **alias it to the plug-in point bean id**
-that the interceptor looks up. This is what "plugging in" means — you override
-the default (empty) strategy with yours.
+The simplest, most reliable migration is to **override the OOTB default strategy
+bean** so your implementation is used with no provider-selection plumbing. In
+`resources/<ext>-spring.xml`, define your bean with the **same id** the platform
+uses for the default strategy, so your extension's definition wins (ensure your
+extension loads after `commercewebservicescommons` in `localextensions.xml`).
 
 ```xml
-<bean id="googleReCaptchaValidationStrategy"
-      class="com.cf400.captcha.strategy.GoogleReCaptchaValidationStrategy">
+<!-- Override the OOTB no-op strategy. Confirm the default bean id by searching
+     commercewebservicescommons-spring.xml (typically 'defaultCaptchaValidationStrategy'). -->
+<bean id="defaultCaptchaValidationStrategy"
+      class="com.alfanar.hybris.ceramic.core.strategies.impl.GoogleReCaptchaValidationStrategy">
     <property name="configurationService" ref="configurationService"/>
 </bean>
-
-<!-- Point the platform's plug-in point at your implementation.
-     ⚠️ Confirm the exact alias/bean id the interceptor resolves in your
-     version (search commercewebservicescommons spring xml for the captcha
-     strategy bean id). Common id: 'captchaValidationStrategy'. -->
-<alias name="googleReCaptchaValidationStrategy" alias="captchaValidationStrategy"/>
 ```
+
+> **Multi-provider alternative:** if the platform keeps a *registry of strategies
+> keyed by `getProviderType()`/`getVersion()`*, don't reuse the default id —
+> register your bean under a new id, return a distinct `CaptchaProviderWsDtoType`
+> from `getProviderType()`, and configure that provider type as active for the
+> store. For a single reCAPTCHA provider, overriding the default bean (above) is
+> simpler and sufficient.
 
 ### 4.3 Annotate / confirm the protected endpoint
 
@@ -350,16 +416,28 @@ Your stated sequence, with CAPTCHA folded in:
 
 ---
 
-## 9. Items to confirm against *your* exact version
+## 9. Confirmed against `2211-jdk21` OOTB (`DefaultCaptchaValidationStrategy`)
 
-Because SAP Help Portal / javadoc are gated, verify these three identifiers in
-your installed `2211-jdk21.13` sources/javadoc before coding:
+These were verified from the OOTB source and are baked into §4 above:
 
-1. The **FQN + method signature** of the CAPTCHA validation strategy interface
-   in `commercewebservicescommons`.
-2. The **bean id** the `CaptchaValidationInterceptor` resolves (the alias
-   target in §4.2).
-3. The exact **header constant** name (currently `sap-commerce-cloud-captcha-token`).
+1. **Interface:** `de.hybris.platform.commercewebservicescommons.strategies.CaptchaValidationStrategy`
+   — four abstract methods: `preCheckToken(CaptchaValidationContext):boolean`,
+   `validate(CaptchaValidationContext):CaptchaValidationResult`,
+   `getProviderType():CaptchaProviderWsDtoType`, `getVersion():CaptchaVersionWsDtoType`.
+2. **DTOs:** `de.hybris.platform.commercewebservicescommons.dto.captcha.*`
+   (`CaptchaValidationContext.getCaptchaToken()`, `CaptchaValidationResult.setSuccess(boolean)`).
+3. **OOTB default** = `DefaultCaptchaValidationStrategy`, whose `validate()` is a
+   **no-op returning `success=true`** — must be overridden (§4.2).
+
+Still worth confirming in *your* build:
+
+- The exact **default bean id** to override in Spring (search
+  `commercewebservicescommons-spring.xml`; typically `defaultCaptchaValidationStrategy`).
+- Whether strategies are selected via a **registry keyed by provider type**
+  (multi-provider) vs. a single default bean (see §4.2 alternative).
+- The available values of the **`CaptchaProviderWsDtoType` / `CaptchaVersionWsDtoType`**
+  enums (for `getProviderType()` / `getVersion()`).
+- The **header constant** the interceptor reads (currently `sap-commerce-cloud-captcha-token`).
 
 ---
 
