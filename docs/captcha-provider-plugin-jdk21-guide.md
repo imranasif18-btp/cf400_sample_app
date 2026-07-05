@@ -28,6 +28,99 @@ yourself against the new plug-in point.
 
 ---
 
+## 1a. Migrating from an existing `captchaaddon` setup
+
+> **Applies to you if:** you are already on `2211-jdk21.13` with the legacy
+> `captchaaddon` still installed and working, using `recaptcha.publickey` /
+> `recaptcha.privatekey` in `local.properties` and per-environment
+> `ccv2-config` properties for DEV / QAS / PROD.
+
+### Deprecated ≠ deleted (why it still works)
+
+`captchaaddon` still **ships and functions** on `2211-jdk21.13` — that is why
+your current setup works. But it is **deprecated and unsupported**: it can be
+removed in a future update patch, and SAP will not fix issues raised against
+it. So you are not forced to migrate in the same cutover as the JDK21 move —
+you can keep it as a **bridge** and migrate on your own schedule.
+
+| Option | What it means | When to pick it |
+|---|---|---|
+| **A. Keep `captchaaddon` (bridge)** | No code change; accept unsupported-status risk | De-risk the JDK21 cutover; migrate later |
+| **B. Migrate to plug-in point** | Remove addon, implement strategy, re-map keys | Supported end state (recommended target) |
+
+This guide assumes **Google reCAPTCHA v2** (checkbox) — the `publickey` /
+`privatekey` naming is the classic v2 convention. For v3 (invisible/score),
+see the score-threshold note in §4.1.
+
+### Property mapping — old → new
+
+The two old properties do **not** map 1:1; the new model splits them by *where
+they live*:
+
+| Old (`captchaaddon`) | New (plug-in point) | Where it lives |
+|---|---|---|
+| `recaptcha.privatekey` (secret) | secret read by your **validation strategy**, server-side | property `captcha.recaptcha.secretKey` — **never** sent to storefront |
+| `recaptcha.publickey` (site key) | site key returned by `GET /{baseSiteId}/captcha/config` | BaseStore field (Backoffice) + property `captcha.recaptcha.publicKey` |
+| addon auto-enabled | **`Captcha Widget Enabled`** flag | per-BaseStore, Backoffice |
+
+### Your DEV / QAS / PROD `ccv2-config`
+
+This carries over almost unchanged — only the **key names** change. Keep the
+**distinct reCAPTCHA key pair per environment** you already maintain (each env's
+domain is registered separately in the Google reCAPTCHA admin console). The
+secret key stays server-side; only the public/site key reaches the browser.
+
+```properties
+# BEFORE (captchaaddon) — per env in ccv2-config (DEV / QAS / PROD)
+recaptcha.publickey=<env site key>
+recaptcha.privatekey=<env secret key>
+
+# AFTER (plug-in point) — same per-env split, renamed
+captcha.recaptcha.publicKey=<env site key>
+captcha.recaptcha.secretKey=<env secret key>
+```
+
+> In CCv2, these remain environment-specific properties (Cloud Portal →
+> environment → Properties, or your `ccv2-config` / manifest `properties` per
+> aspect). No change to *how* you scope them per environment — just the names.
+
+### Step-by-step migration (A → B)
+
+1. **Deploy the new strategy alongside the addon.** Add the `cf400captcha`
+   extension (§4) with the validation strategy + Spring alias. Do **not** remove
+   `captchaaddon` yet — both can coexist while you validate.
+2. **Add the renamed properties** (`captcha.recaptcha.secretKey` /
+   `.publicKey`) to `local.properties` and to each env's `ccv2-config`,
+   alongside the old ones for now.
+3. **Enable the plug-in path per BaseStore:** set `Captcha Widget Enabled = true`
+   and the site key on the BaseStore (§5).
+4. **Confirm the OCC contract:** `GET /{baseSiteId}/captcha/config` returns
+   `enabled: true` + the new site key; registration sends the
+   `sap-commerce-cloud-captcha-token` header (§6, §7).
+5. **Switch the storefront** to the Composable Captcha component + `CaptchaGuard`
+   (if you are on Accelerator JSP, the addon's JSP widget is what you are
+   replacing — see note below).
+6. **Remove `captchaaddon`:** delete it from `localextensions.xml` and from the
+   storefront addon install, then delete the old `recaptcha.publickey` /
+   `recaptcha.privatekey` properties from all envs.
+7. **Regression test** registration on every environment (DEV → QAS → PROD).
+
+> **Accelerator (JSP) storefront note:** `captchaaddon` renders a server-side
+> JSP widget. The plug-in point is OCC/header-based, designed for Composable
+> Storefront. If your B2C storefront is **Accelerator JSP** (not Spartacus),
+> confirm with SAP how they expect the widget rendered on JSP once the addon is
+> gone — the plug-in point covers *validation*, but the JSP-side *widget
+> rendering* was the addon's job. This is the one gap to clarify before fully
+> removing the addon on a JSP storefront.
+
+### Rollback
+
+Because you migrate additively (step 1–4 leave `captchaaddon` in place), rollback
+is: set `Captcha Widget Enabled = false` (or revert to the addon's flag) and
+redeploy — the old addon path resumes with the old properties still present.
+
+---
+
 ## 2. Architecture / request flow
 
 ```
